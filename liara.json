@@ -1,0 +1,18 @@
+{
+  "app": "liarapilot",
+  "platform": "docker",
+  "port": 3000,
+  "disks": [
+    {
+      "name": "liarapilot-data",
+      "mountTo": "/app/data"
+    }
+  ],
+  "healthCheck": {
+    "command": "CMD wget -q -O /dev/null http://localhost:3000/api/health || exit 1",
+    "interval": 30,
+    "timeout": 10,
+    "retries": 3,
+    "startPeriod": 30
+  }
+}

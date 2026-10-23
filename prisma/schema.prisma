@@ -1,0 +1,452 @@
+// LiaraPilot persistence schema
+// SQLite for the sandbox MVP. Column types chosen to port to PostgreSQL
+// with minimal changes (no SQLite-specific features used).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & tenancy
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String?
+  passwordHash String? // legacy (no site login in the commercial product)
+  // Per-browser workspace binding: middleware sets the "lp_ws" cookie, the
+  // first API call provisions the matching user row. No login screen.
+  workspaceKey String? @unique
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions      Session[]
+  projects      Project[]
+  ghConnection  GitHubConnection?
+  glConnection  GitLabConnection?
+  liaraConn     LiaraConnection?
+  aiConn        AiConnection?
+  oauthAccounts OAuthAccount[]
+}
+
+/// User-provided AI (LLM) connection — entered in the UI, never in env.
+model AiConnection {
+  id         String   @id @default(cuid())
+  userId     String   @unique
+  provider   String   @default("openai") // OpenAI-compatible REST
+  baseUrl    String   @default("https://api.openai.com/v1")
+  model      String   @default("gpt-4o-mini")
+  apiKeyRef  String // enc:... credential reference
+  verified   Boolean  @default(false)
+  verifiedAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Global, per-deployment OAuth app registration (Device Flow) for browser
+/// logins. Configured once by the deployment owner in Settings — NOT env.
+model AppConfig {
+  id                   String   @id @default("app")
+  githubClientId       String?
+  gitlabClientId       String?
+  gitlabClientSecretRef String?
+  gitlabInstanceUrl    String   @default("https://gitlab.com")
+  updatedAt            DateTime @updatedAt
+}
+
+/// Linked OAuth identities (Sign in with GitHub / GitLab).
+/// Access tokens are stored as encrypted references, never plaintext.
+model OAuthAccount {
+  id                String   @id @default(cuid())
+  userId            String
+  provider          String // "github" | "gitlab"
+  providerAccountId String
+  username          String?
+  avatarUrl         String?
+  accessTokenRef    String // enc:... credential reference
+  scope             String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique // opaque session token; cookie holds this only
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Integration connections (credential VALUES are never stored here in plain
+// text in production; this MVP stores them in an encrypted-at-rest table or
+// reads them from env. See security/credentials.ts)
+// ---------------------------------------------------------------------------
+
+model GitHubConnection {
+  id         String   @id @default(cuid())
+  userId     String   @unique
+  // Reference to a credential in the credential store (or "env:GITHUB_TOKEN")
+  tokenRef   String
+  login      String?
+  scopes     String? // JSON array
+  via        String   @default("pat") // "pat" | "oauth" | "env"
+  verified   Boolean  @default(false)
+  verifiedAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model GitLabConnection {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  tokenRef    String // credential reference (enc:...), never the token itself
+  instanceUrl String   @default("https://gitlab.com")
+  login       String?
+  via         String   @default("pat") // "pat" | "oauth"
+  verified    Boolean  @default(false)
+  verifiedAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model LiaraConnection {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  tokenRef     String // credential reference, never the token itself
+  accountEmail String? // from GET /v1/me at connect time (masked display)
+  region       String?
+  verified     Boolean  @default(false)
+  verifiedAt   DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+model Project {
+  id             String    @id @default(cuid())
+  userId         String
+  name           String // human label
+  repoProvider   String    @default("github") // "github" | "gitlab"
+  repoOwner      String
+  repoName       String
+  repoBranch     String    @default("main")
+  defaultBranch  String?
+  // deployment / ops state
+  liaraAppName   String?
+  deployedSha    String?
+  lastProfileSha String? // analysis cache key (repo + sha)
+  // monitoring policy: "low_cost" | "balanced" | "fast"
+  monitorPolicy  String    @default("balanced")
+  monitorEnabled Boolean   @default(true)
+  checkIntervalS Int       @default(60)
+  healthUrl      String? // public URL to probe
+  // investigator budget controls
+  maxInvestigationsPerDay Int @default(10)
+  archived       Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  snapshots      AnalysisSnapshot[]
+  plans          DeploymentPlan[]
+  executions     DeploymentExecution[]
+  runs           WorkflowRun[]
+  incidents      Incident[]
+  healthChecks   HealthCheck[]
+  approvals      ApprovalRequest[]
+  chatMessages   ChatMessage[]
+
+  @@unique([userId, repoOwner, repoName])
+  @@index([userId])
+}
+
+// Cached structured profile per analyzed revision
+model AnalysisSnapshot {
+  id          String   @id @default(cuid())
+  projectId   String
+  commitSha   String
+  profileJson String // JSON ProjectProfile
+  createdAt   DateTime @default(now())
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, commitSha])
+}
+
+// ---------------------------------------------------------------------------
+// Deployment planning & execution
+// ---------------------------------------------------------------------------
+
+model DeploymentPlan {
+  id           String   @id @default(cuid())
+  projectId    String
+  runId        String?
+  commitSha    String
+  planHash     String // sha256 of canonical plan; approval binding
+  planJson     String // JSON DeploymentPlanData
+  status       String   @default("proposed") // proposed | approved | rejected | expired | executed | superseded
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  executions   DeploymentExecution[]
+  approvals    ApprovalRequest[]
+
+  @@index([projectId, status])
+}
+
+model DeploymentExecution {
+  id           String   @id @default(cuid())
+  planId       String
+  projectId    String
+  commitSha    String
+  method       String // "liara_cli_deploy" | "liara_api_sources" | "unsupported"
+  status       String   @default("pending") // pending | running | succeeded | failed | cancelled
+  stage        String? // prepare|build|upload|platform|verify
+  exitCode     Int?
+  resultJson   String? // structured result: logs refs, release id, errors
+  idempotencyKey String @unique
+  attempts     Int      @default(0)
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  createdAt    DateTime @default(now())
+  plan         DeploymentPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Agent workflows (LangGraph runs)
+// ---------------------------------------------------------------------------
+
+model WorkflowRun {
+  id        String   @id @default(cuid())
+  threadId  String   @unique // LangGraph thread
+  projectId String?
+  userId    String
+  kind      String // deploy_pipeline | incident_investigation | chat_assist
+  trigger   String // repo_connected | push_event | manual | health_check | scheduled | incident | chat
+  status    String   @default("queued") // queued|running|awaiting_approval|verifying|succeeded|failed|cancelled
+  stage     String? // current node name
+  inputJson String?
+  stateJson String? // last materialized state (mirrors checkpoint for fast UI reads)
+  reportJson String? // final user-facing report
+  error     String?
+  startedAt DateTime?
+  finishedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events    WorkflowEvent[]
+  project   Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, status])
+  @@index([status])
+}
+
+model WorkflowEvent {
+  id        Int      @id @default(autoincrement())
+  runId     String
+  node      String
+  level     String   @default("info") // info|warn|error|success
+  message   String
+  dataJson  String?
+  createdAt DateTime @default(now())
+  run       WorkflowRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId, id])
+}
+
+// LangGraph durable checkpoint storage (PrismaCheckpointSaver)
+model AgentCheckpoint {
+  id        String   @id // `${threadId}:${ns}:${checkpointId}`
+  threadId  String
+  checkpointNs String @default("")
+  checkpointId String
+  ts        String // ISO timestamp
+  parentCheckpointId String?
+  blob      String // serialized whole checkpoint (MemorySaver-compatible)
+  metadata  String // serialized metadata
+  createdAt DateTime @default(now())
+
+  @@unique([threadId, checkpointNs, checkpointId])
+  @@index([threadId])
+}
+
+model AgentCheckpointWrite {
+  id       String @id @default(cuid())
+  threadId String
+  checkpointNs String @default("")
+  checkpointId String
+  taskId   String
+  taskPath String @default("")
+  idx      Int // WRITES_IDX_MAP[channel] || idx (MemorySaver-compatible key)
+  channel  String
+  type     String
+  blob     String
+  createdAt DateTime @default(now())
+
+  @@unique([threadId, checkpointNs, checkpointId, taskId, idx])
+  @@index([threadId, checkpointId])
+}
+
+// ---------------------------------------------------------------------------
+// SRE: health checks & incidents
+// ---------------------------------------------------------------------------
+
+model HealthCheck {
+  id         String   @id @default(cuid())
+  projectId  String
+  target     String
+  status     String // "up" | "down" | "degraded" | "error"
+  httpStatus Int?
+  latencyMs  Int?
+  error      String?
+  createdAt  DateTime @default(now())
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt])
+}
+
+model Incident {
+  id           String   @id @default(cuid())
+  projectId    String
+  kind         String // http_5xx | timeout | deployment_failed | unhealthy | resource_threshold
+  status       String   @default("detected") // detected|investigating|awaiting_approval|remediating|verifying|resolved|escalated|muted
+  title        String
+  summary      String?
+  evidenceJson String // bounded evidence package (redacted)
+  diagnosisJson String? // diagnosis: facts, causes, confidence
+  remediationJson String? // proposed remediation(s)
+  firstSeenAt  DateTime @default(now())
+  lastSeenAt   DateTime @default(now())
+  resolvedAt   DateTime?
+  runId        String? // investigation workflow
+  detectionKey String // dedup key
+  cooldownUntil DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, detectionKey])
+  @@index([projectId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Human-in-the-loop approvals & audit
+// ---------------------------------------------------------------------------
+
+model ApprovalRequest {
+  id          String   @id @default(cuid())
+  projectId   String?
+  planId      String?
+  runId       String?
+  incidentId  String?
+  userId      String
+  actionType  String // deploy_production | restart_app | set_env | rollback | repo_write | scale | create_app
+  targetRef   String // exact resource
+  title       String
+  rationale   String
+  evidenceJson String
+  riskJson    String // risks, reversibility, failure effects
+  planHash    String // binding: invalid if plan changes
+  payloadJson String // exact action payload validated before execution
+  status      String   @default("pending") // pending|approved|rejected|expired|executed|execution_failed
+  expiresAt   DateTime
+  plan        DeploymentPlan? @relation(fields: [planId], references: [id], onDelete: SetNull)
+  decidedAt   DateTime?
+  executedAt  DateTime?
+  createdAt   DateTime @default(now())
+  project     Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([projectId, status])
+}
+
+model AuditEvent {
+  id        Int      @id @default(autoincrement())
+  userId    String?
+  projectId String?
+  kind      String // approval.granted | approval.denied | execution.attempt | execution.result | incident.* | ...
+  actor     String @default("agent") // agent | user | system
+  detailJson String?
+  createdAt DateTime @default(now())
+
+  @@index([projectId, createdAt])
+  @@index([userId, createdAt])
+}
+
+model UsageRecord {
+  id        Int      @id @default(autoincrement())
+  userId    String?
+  projectId String?
+  kind      String // llm_call | health_check | github_call | investigation
+  quantity  Int      @default(1)
+  tokensIn  Int      @default(0)
+  tokensOut Int      @default(0)
+  note      String?
+  createdAt DateTime @default(now())
+
+  @@index([projectId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Contextual chat (optional channel; same permissions, no extra powers)
+// ---------------------------------------------------------------------------
+
+model ChatMessage {
+  id        String   @id @default(cuid())
+  projectId String?
+  userId    String
+  role      String // user | assistant | system
+  content   String
+  metaJson  String?
+  createdAt DateTime @default(now())
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs (DB-backed queue; processed by in-process worker)
+// ---------------------------------------------------------------------------
+
+model Job {
+  id        String   @id @default(cuid())
+  kind      String // run_workflow | health_check_sweep | investigate_incident | verify_incident | expire_approvals | reanalyze
+  payloadJson String
+  status    String   @default("queued") // queued|running|succeeded|failed|cancelled
+  priority  Int      @default(5) // lower = sooner
+  runAt     DateTime @default(now())
+  attempts  Int      @default(0)
+  maxAttempts Int    @default(3)
+  lastError String?
+  dedupeKey String? // e.g. "deploy:<projectId>:<sha>"
+  startedAt DateTime?
+  finishedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, runAt, priority])
+  @@unique([dedupeKey, status])
+}

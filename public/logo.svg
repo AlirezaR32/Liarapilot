@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="liara-g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#87fcc4"/>
+      <stop offset="1" stop-color="#28c1f5"/>
+    </linearGradient>
+    <linearGradient id="liara-plane" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1512"/>
+      <stop offset="1" stop-color="#123028"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#liara-g)"/>
+  <path d="M14 33.5 49 16l-8.5 32-9.5-10.5-6.5 8-1.5-11z" fill="url(#liara-plane)"/>
+  <path d="M31 37.5 49 16l-8.5 32-9.5-10.5z" fill="#0b1512" opacity="0.55"/>
+</svg>
